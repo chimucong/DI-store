@@ -30,7 +30,7 @@ message FetchRequest {
     string object_id_hex = 1;
     bool via_rpc = 2;
     string src_node = 3;
-    bool src_node_only = 4;
+    bool src_node_only = 4; // If true, fetch from src_node only. Otherwise, fetch from other nodes if src_nodde fails.
 }
 
 message FetchResponse {}
