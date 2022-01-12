@@ -8,6 +8,7 @@ import (
 	pbObjectStore "di_store/pb/storage_server"
 	"di_store/plasma_client"
 	plasma "di_store/plasma_server"
+	"di_store/rdma"
 	"di_store/util"
 	"encoding/hex"
 	"fmt"
@@ -36,6 +37,7 @@ type StorageServer struct {
 	mu                  sync.Mutex
 	FetchTaskManager    *FetchTaskManager
 	GroupList           []string
+	RdmaDevice          *rdma.Device
 }
 
 func NewStorageServer(
@@ -91,7 +93,11 @@ func NewStorageServer(
 	if err != nil {
 		return nil, fmt.Errorf("failed to register storage server: %v", err)
 	}
-
+	// todo init rdma device
+	rdmaDev, err := rdma.OpenDevice("mlx5_0")
+	if err != nil {
+		return nil, err
+	}
 	server := &StorageServer{
 		Hostname:             hostname,
 		PlasmaClient:         plasmaClient,
@@ -101,6 +107,7 @@ func NewStorageServer(
 		ServerInfoMap:        make(map[string]*pbNodeTracker.StorageServer),
 		FetchTaskManager:     NewFetchTaskManager(),
 		GroupList:            groupList,
+		RdmaDevice:           rdmaDev,
 	}
 
 	err = server.UpdateServerInfoMap(context.Background())
@@ -221,7 +228,6 @@ func (server *StorageServer) Fetch(ctx context.Context, in *pbObjectStore.FetchR
 	defer span.Finish()
 
 	oidHex := in.GetObjectIdHex()
-	viaRpc := in.GetViaRpc()
 	srcNode := in.GetSrcNode()
 	srcNodeOnly := in.GetSrcNodeOnly()
 
@@ -244,11 +250,7 @@ func (server *StorageServer) Fetch(ctx context.Context, in *pbObjectStore.FetchR
 		return &pbObjectStore.FetchResponse{}, nil
 	}
 
-	if viaRpc {
-		err = server.FetchTaskManager.Fetch(ctx, oid, srcNode, srcNodeOnly, server.fetchViaRpc)
-	} else {
-		err = server.FetchTaskManager.Fetch(ctx, oid, srcNode, srcNodeOnly, server.fetchViaSocket)
-	}
+	err = server.FetchTaskManager.Fetch(ctx, oid, srcNode, srcNodeOnly, server.fetchViaRdma)
 
 	if err != nil {
 		return nil, err

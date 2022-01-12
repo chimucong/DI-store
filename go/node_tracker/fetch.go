@@ -145,7 +145,6 @@ func (tracker *NodeTracker) DoFetch(ctx context.Context, objID string, src strin
 	client := pbObjectStore.NewObjectStoreClient(conn)
 	req := pbObjectStore.FetchRequest{
 		ObjectIdHex: objID,
-		ViaRpc:      false,
 		SrcNode:     src,
 		SrcNodeOnly: true,
 	}

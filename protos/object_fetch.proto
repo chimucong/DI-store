@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+option go_package = "di_store/pb/object_fetch";
+
+package di_store.object_fetch;
+
+message FetchHeader {
+    bytes object_id = 1;
+    int64 object_length = 2;
+    bool rdma_support = 3;
+    bytes span_ctx = 4;
+    string error_msg = 5;
+}
+
+message ConnectionInfo {
+    bytes info = 1;
+}
+
+message RBuf {
+    bytes rbuf = 1;
+}

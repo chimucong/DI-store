@@ -6,7 +6,10 @@ import (
 	fb_object "di_store/fb/object"
 	"di_store/node_tracker"
 	pb_node_tracker "di_store/pb/node_tracker"
+	pb_object_fetch "di_store/pb/object_fetch"
 	pbObjectStore "di_store/pb/storage_server"
+	"di_store/plasma_client"
+	"di_store/rdma"
 	"di_store/tracing"
 	"di_store/util"
 	"encoding/hex"
@@ -21,6 +24,7 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 type TaskState int
@@ -176,6 +180,191 @@ func (server *StorageServer) fetchViaSocket(ctx context.Context, oid []byte, src
 	return server.fetchWithRetry(ctx, oid, srcNode, srcNodeOnly, server.tryFetchViaSocket)
 }
 
+func (server *StorageServer) fetchViaRdma(ctx context.Context, oid []byte, srcNode string, srcNodeOnly bool) error {
+	return server.fetchWithRetry(ctx, oid, srcNode, srcNodeOnly, server.tryFetchViaRdma)
+}
+
+func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, remoteServerInfo *pb_node_tracker.StorageServer) error {
+	rdmaSupport := true // todo read from configure
+	span, ctx := opentracing.StartSpanFromContext(ctx, "StorageServer.tryFetch2")
+	defer span.Finish()
+
+	target := remoteServerInfo.GetObjTransferTarget()
+
+	_span, _ := opentracing.StartSpanFromContext(ctx, "net.Dial")
+	conn, err := net.Dial("tcp", target)
+	if err != nil {
+		_span.LogFields(ot_log.Error(err))
+		_span.Finish()
+		return errors.Wrapf(err, "net.Dial %v", target)
+	}
+	_span.Finish()
+	defer conn.Close()
+
+	rw := util.NewBytesReadWriter(conn)
+	var spanCtx []byte
+	if tracing.Enabled {
+		var buf bytes.Buffer
+		writer := io.Writer(&buf)
+		err := span.Tracer().Inject(span.Context(), opentracing.Binary, writer)
+		if err != nil {
+			err = errors.Wrap(err, "tryFetch2: inject span error")
+			log.Error("%+v", err)
+		} else {
+			spanCtx = buf.Bytes()
+		}
+	}
+
+	header := &pb_object_fetch.FetchHeader{
+		SpanCtx:     spanCtx,
+		ObjectId:    oid,
+		RdmaSupport: rdmaSupport}
+	buf, err := proto.Marshal(header)
+	if err != nil {
+		return err
+	}
+	_span, _ = opentracing.StartSpanFromContext(ctx, "request.write.header")
+	_, err = rw.Write(buf)
+	_span.Finish()
+	if err != nil {
+		return err
+	}
+
+	_span, _ = opentracing.StartSpanFromContext(ctx, "response.read.header")
+	buf, err = rw.Read(nil)
+	_span.Finish()
+	if err != nil {
+		return err
+	}
+	err = proto.Unmarshal(buf, header)
+	if err != nil {
+		return err
+	}
+
+	if err := header.GetErrorMsg(); len(err) > 0 {
+		err := errors.Errorf("fetch error from remote: %v, %v", target, string(err))
+		log.Error(err)
+		return err
+	}
+
+	if header.GetObjectLength() < 0 {
+		err := errors.Wrapf(util.ErrNotFound, "object %s not found on server %s", hex.EncodeToString(oid), target)
+		return err
+	}
+
+	chCreateBuf := make(chan error, 1)
+	chRdmaCtx := make(chan *rdma.Context, 1)
+
+	var plasmaBuff *plasma_client.Buff
+	defer func() {
+		plasmaBuff.Release(ctx)
+	}()
+
+	var objectHanging bool
+	defer func() {
+		if objectHanging {
+			server.PlasmaClient.Abort(ctx, oid)
+		}
+	}()
+	go func() {
+		var err1 error
+		plasmaBuff, err1 = server.PlasmaClient.Create(ctx, oid, int(header.GetObjectLength()))
+		if err1 != nil {
+			chCreateBuf <- err1
+			return
+		}
+		objectHanging = true
+		if header.GetRdmaSupport() {
+			rdmaCtx := <-chRdmaCtx
+			if rdmaCtx != nil {
+				chCreateBuf <- rdmaCtx.RegMr(plasmaBuff.ToByteSlice())
+				return
+			}
+		}
+		chCreateBuf <- nil
+
+	}()
+
+	if header.GetRdmaSupport() {
+		rdmaCtx, err := server.RdmaDevice.NewContext()
+		chRdmaCtx <- rdmaCtx
+		if err != nil {
+			return err
+		}
+		defer rdmaCtx.Close()
+
+		connInfo, err := rdmaCtx.GetConnectionInfo()
+		if err != nil {
+			return err
+		}
+
+		connInfoMsg := &pb_object_fetch.ConnectionInfo{Info: connInfo.ToBytes()}
+		buf, err := proto.Marshal(connInfoMsg)
+		if err != nil {
+			return err
+		}
+		_, err = rw.Write(buf)
+		if err != nil {
+			return err
+		}
+
+		buf, err = rw.Read(nil)
+		if err != nil {
+			return err
+		}
+
+		err = proto.Unmarshal(buf, connInfoMsg)
+		if err != nil {
+			return err
+		}
+		connInfo = rdma.ConnectionInfoFromBytes(connInfoMsg.GetInfo())
+
+		err = rdmaCtx.Connect(connInfo)
+		if err != nil {
+			return err
+		}
+
+		buf, err = rw.Read(nil)
+		if err != nil {
+			return err
+		}
+		rBufMsg := pb_object_fetch.RBuf{}
+		err = proto.Unmarshal(buf, &rBufMsg)
+		if err != nil {
+			return err
+		}
+		rBuf := rdma.BufFromBytes(rBufMsg.GetRbuf())
+		err = <-chCreateBuf
+		if err != nil {
+			return err
+		}
+		err = rdmaCtx.Read(rBuf)
+		if err != nil {
+			return err
+		}
+		rdmaCtx.PostSendEmpty(true)
+		err = rdmaCtx.Poll(20000)
+		if err != nil {
+			return err
+		}
+	} else {
+		err = <-chCreateBuf
+		if err != nil {
+			return err
+		}
+		_span, _ = opentracing.StartSpanFromContext(ctx, "response.read.socket_data")
+		_, err = rw.Read(plasmaBuff.ToByteSlice())
+		_span.Finish()
+		if err != nil {
+			return err
+		}
+	}
+
+	span.LogFields(ot_log.Int("object_length", int(header.GetObjectLength())))
+	objectHanging = false
+	return server.PlasmaClient.Seal(ctx, oid)
+}
+
 func (server *StorageServer) tryFetchViaSocket(ctx context.Context, oid []byte, remoteServerInfo *pb_node_tracker.StorageServer) error {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "StorageServer.tryFetchViaSocket")
 	defer span.Finish()
@@ -265,7 +454,187 @@ func (server *StorageServer) objTransferListenLoop() {
 	}
 }
 
+// xxx
 func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn net.Conn) {
+	rw := util.NewBytesReadWriter(conn)
+	defer conn.Close()
+
+	var oid, data []byte
+	var finErr error
+	var span opentracing.Span
+	var rdmaSupport bool
+	{
+		buf, err := rw.Read(nil)
+		if err != nil {
+			finErr = err
+			goto FIN
+		}
+		header := &pb_object_fetch.FetchHeader{}
+		err = proto.Unmarshal(buf, header)
+		if err != nil {
+			finErr = err
+			goto FIN
+		}
+		rdmaSupport = header.GetRdmaSupport()
+		if err := header.GetErrorMsg(); len(err) > 0 {
+			finErr = errors.New(err)
+			goto FIN
+		}
+
+		if tracing.Enabled {
+			tracer := opentracing.GlobalTracer()
+			if spanCtxBytes := header.GetSpanCtx(); len(spanCtxBytes) > 0 {
+				carrier := bytes.NewReader(spanCtxBytes)
+				if sCtx, err := tracer.Extract(opentracing.Binary, carrier); err == nil {
+					span = tracer.StartSpan("processObjTransferRequest", opentracing.ChildOf(sCtx))
+				} else {
+					log.Warnf("%+v", errors.Wrap(err, "processObjTransferRequest, extract span info from request"))
+				}
+			}
+
+			if span == nil {
+				span = tracer.StartSpan("processObjTransferRequest")
+			}
+
+			defer span.Finish()
+			ctx = opentracing.ContextWithSpan(ctx, span)
+		}
+
+		oid = header.GetObjectId()
+		if len(oid) != 20 {
+			finErr = fmt.Errorf("oid len error: %v", len(oid))
+			goto FIN
+		}
+		buff, err := server.PlasmaClient.GetBuff(ctx, oid)
+		defer buff.Release(ctx)
+		if err != nil {
+			finErr = err
+			goto FIN
+		}
+		if buff.IsEmpty() {
+			finErr = fmt.Errorf("object not found")
+		} else {
+			data = util.BytesWithoutCopy(buff.Data(), buff.Size())
+		}
+	}
+FIN:
+	err := func() error {
+		var objectLength = -1
+		if data != nil {
+			objectLength = len(data)
+		}
+		errMsg := ""
+		if finErr != nil {
+			errMsg = finErr.Error()
+		}
+		//todo rdma support
+		header := &pb_object_fetch.FetchHeader{
+			ObjectId:     oid,
+			ObjectLength: int64(objectLength),
+			RdmaSupport:  rdmaSupport,
+			ErrorMsg:     errMsg,
+		}
+		buf, err := proto.Marshal(header)
+		if err != nil {
+			return err
+		}
+
+		_span, _ := opentracing.StartSpanFromContext(ctx, "processObjTransferRequest.WriteHeader")
+		_, err = rw.Write(buf)
+		_span.Finish()
+		if err != nil {
+			return err
+		}
+
+		if rdmaSupport {
+			rdmaCtx, err := server.RdmaDevice.NewContext()
+			if err != nil {
+				return err
+			}
+			defer rdmaCtx.Close()
+
+			chRegMr := make(chan error, 1)
+			go func() {
+				chRegMr <- rdmaCtx.RegMr(data)
+			}()
+
+			connInfo, err := rdmaCtx.GetConnectionInfo()
+			if err != nil {
+				return err
+			}
+			connInfoMsg := &pb_object_fetch.ConnectionInfo{Info: connInfo.ToBytes()}
+			buf, err := proto.Marshal(connInfoMsg)
+			if err != nil {
+				return err
+			}
+			_, err = rw.Write(buf)
+			if err != nil {
+				return err
+			}
+
+			buf, err = rw.Read(nil)
+			if err != nil {
+				return err
+			}
+
+			err = proto.Unmarshal(buf, connInfoMsg)
+			if err != nil {
+				return err
+			}
+			connInfo = rdma.ConnectionInfoFromBytes(connInfoMsg.GetInfo())
+			err = rdmaCtx.Connect(connInfo)
+			if err != nil {
+				return err
+			}
+
+			err = <-chRegMr
+			if err != nil {
+				return err
+			}
+
+			rbuf, err := rdmaCtx.GetBuf()
+			if err != nil {
+				return err
+			}
+			err = rdmaCtx.PostRecvEmpty()
+			if err != nil {
+				return err
+			}
+
+			rBufMsg := pb_object_fetch.RBuf{Rbuf: rbuf.ToBytes()}
+			buf, err = proto.Marshal(&rBufMsg)
+			if err != nil {
+				return err
+			}
+			_, err = rw.Write(buf)
+			if err != nil {
+				return err
+			}
+			err = rdmaCtx.Poll(20000)
+			if err != nil {
+				return err
+			}
+		} else {
+			_span, _ = opentracing.StartSpanFromContext(ctx, "processObjTransferRequest.WriteData")
+			_, err = rw.Write(data)
+			_span.Finish()
+		}
+
+		if span != nil {
+			span.LogFields(ot_log.Int("object_length", len(data)))
+		}
+
+		return nil
+	}()
+	if finErr != nil {
+		log.Error(fmt.Errorf("processObjTransferRequest error: %v", finErr))
+	}
+	if err != nil {
+		log.Error(fmt.Errorf("processObjTransferRequest error: %v", err))
+	}
+}
+
+func (server *StorageServer) processObjTransferRequestTmp(ctx context.Context, conn net.Conn) {
 	rw := util.NewBytesReadWriter(conn)
 	defer conn.Close()
 
