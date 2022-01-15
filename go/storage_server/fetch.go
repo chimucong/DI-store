@@ -185,8 +185,7 @@ func (server *StorageServer) fetchViaRdma(ctx context.Context, oid []byte, srcNo
 }
 
 func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, remoteServerInfo *pb_node_tracker.StorageServer) error {
-	rdmaSupport := true // todo read from configure
-	span, ctx := opentracing.StartSpanFromContext(ctx, "StorageServer.tryFetch2")
+	span, ctx := opentracing.StartSpanFromContext(ctx, "StorageServer.tryFetchViaRdma")
 	defer span.Finish()
 
 	target := remoteServerInfo.GetObjTransferTarget()
@@ -208,17 +207,18 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 		writer := io.Writer(&buf)
 		err := span.Tracer().Inject(span.Context(), opentracing.Binary, writer)
 		if err != nil {
-			err = errors.Wrap(err, "tryFetch2: inject span error")
+			err = errors.Wrap(err, "tryFetchViaRdma: inject span error")
 			log.Error("%+v", err)
 		} else {
 			spanCtx = buf.Bytes()
 		}
 	}
-
+	rdmaSupport := server.RdmaDevice != nil
 	header := &pb_object_fetch.FetchHeader{
 		SpanCtx:     spanCtx,
 		ObjectId:    oid,
-		RdmaSupport: rdmaSupport}
+		RdmaSupport: rdmaSupport,
+	}
 	buf, err := proto.Marshal(header)
 	if err != nil {
 		return err
@@ -277,7 +277,7 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 		if header.GetRdmaSupport() {
 			rdmaCtx := <-chRdmaCtx
 			if rdmaCtx != nil {
-				chCreateBuf <- rdmaCtx.RegMr(plasmaBuff.ToByteSlice())
+				chCreateBuf <- rdmaCtx.RegMr(ctx, plasmaBuff.ToByteSlice())
 				return
 			}
 		}
@@ -286,12 +286,13 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 	}()
 
 	if header.GetRdmaSupport() {
-		rdmaCtx, err := server.RdmaDevice.NewContext()
+		log.Debug("fetch via rdma")
+		rdmaCtx, err := server.RdmaDevice.NewContext(ctx)
 		chRdmaCtx <- rdmaCtx
 		if err != nil {
 			return err
 		}
-		defer rdmaCtx.Close()
+		defer rdmaCtx.Close(ctx)
 
 		connInfo, err := rdmaCtx.GetConnectionInfo()
 		if err != nil {
@@ -319,7 +320,7 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 		}
 		connInfo = rdma.ConnectionInfoFromBytes(connInfoMsg.GetInfo())
 
-		err = rdmaCtx.Connect(connInfo)
+		err = rdmaCtx.Connect(ctx, connInfo)
 		if err != nil {
 			return err
 		}
@@ -338,12 +339,12 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 		if err != nil {
 			return err
 		}
-		err = rdmaCtx.Read(rBuf)
+		err = rdmaCtx.Read(ctx, rBuf)
 		if err != nil {
 			return err
 		}
-		rdmaCtx.PostSendEmpty(true)
-		err = rdmaCtx.Poll(20000)
+		rdmaCtx.PostSendEmpty(ctx, true)
+		err = rdmaCtx.Poll(ctx, rdma.POLL_TIMEOUT_MS)
 		if err != nil {
 			return err
 		}
@@ -454,15 +455,16 @@ func (server *StorageServer) objTransferListenLoop() {
 	}
 }
 
-// xxx
 func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn net.Conn) {
+	log.Debugf("processObjTransferRequest, remote: %v", conn.RemoteAddr().String())
+
 	rw := util.NewBytesReadWriter(conn)
 	defer conn.Close()
 
 	var oid, data []byte
 	var finErr error
 	var span opentracing.Span
-	var rdmaSupport bool
+	var remoteRdmaSupport bool
 	{
 		buf, err := rw.Read(nil)
 		if err != nil {
@@ -475,7 +477,7 @@ func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn
 			finErr = err
 			goto FIN
 		}
-		rdmaSupport = header.GetRdmaSupport()
+		remoteRdmaSupport = header.GetRdmaSupport()
 		if err := header.GetErrorMsg(); len(err) > 0 {
 			finErr = errors.New(err)
 			goto FIN
@@ -527,7 +529,8 @@ FIN:
 		if finErr != nil {
 			errMsg = finErr.Error()
 		}
-		//todo rdma support
+
+		rdmaSupport := server.RdmaDevice != nil && remoteRdmaSupport && objectLength >= int(server.RdmaTransferThreshold)
 		header := &pb_object_fetch.FetchHeader{
 			ObjectId:     oid,
 			ObjectLength: int64(objectLength),
@@ -547,15 +550,15 @@ FIN:
 		}
 
 		if rdmaSupport {
-			rdmaCtx, err := server.RdmaDevice.NewContext()
+			rdmaCtx, err := server.RdmaDevice.NewContext(ctx)
 			if err != nil {
 				return err
 			}
-			defer rdmaCtx.Close()
+			defer rdmaCtx.Close(ctx)
 
 			chRegMr := make(chan error, 1)
 			go func() {
-				chRegMr <- rdmaCtx.RegMr(data)
+				chRegMr <- rdmaCtx.RegMr(ctx, data)
 			}()
 
 			connInfo, err := rdmaCtx.GetConnectionInfo()
@@ -582,7 +585,7 @@ FIN:
 				return err
 			}
 			connInfo = rdma.ConnectionInfoFromBytes(connInfoMsg.GetInfo())
-			err = rdmaCtx.Connect(connInfo)
+			err = rdmaCtx.Connect(ctx, connInfo)
 			if err != nil {
 				return err
 			}
@@ -596,7 +599,7 @@ FIN:
 			if err != nil {
 				return err
 			}
-			err = rdmaCtx.PostRecvEmpty()
+			err = rdmaCtx.PostRecvEmpty(ctx)
 			if err != nil {
 				return err
 			}
@@ -610,7 +613,7 @@ FIN:
 			if err != nil {
 				return err
 			}
-			err = rdmaCtx.Poll(20000)
+			err = rdmaCtx.Poll(ctx, rdma.POLL_TIMEOUT_MS)
 			if err != nil {
 				return err
 			}

@@ -8,9 +8,11 @@ size_t IBBufSize = sizeof(IBBuf);
 */
 import "C"
 import (
+	"context"
 	"runtime"
 	"unsafe"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -75,12 +77,12 @@ func msgToError(cmsg *C.char) error {
 	}
 }
 
-func OpenDevice(name string) (*Device, error) {
+func OpenDevice(name string, ibPort uint8, gidIndex uint8) (*Device, error) {
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
 
 	device := &Device{}
-	msg := C.IBOpenDevice(cname, 1, 1, &device.device)
+	msg := C.IBOpenDevice(cname, C.uchar(ibPort), C.uchar(gidIndex), &device.device)
 	err := msgToError(msg)
 	if err != nil {
 		return nil, err
@@ -104,7 +106,9 @@ func (device *Device) Close() error {
 	return msgToError(msg)
 }
 
-func (device *Device) NewContext() (*Context, error) {
+func (device *Device) NewContext(ctx context.Context) (*Context, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Device.NewContext")
+	defer span.Finish()
 	context := &Context{}
 	msg := C.IBNewContext(device.device, &context.context)
 	err := msgToError(msg)
@@ -114,36 +118,50 @@ func (device *Device) NewContext() (*Context, error) {
 	return context, nil
 }
 
-func (context *Context) Close() error {
+func (context *Context) Close(ctx context.Context) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.Close")
+	defer span.Finish()
 	msg := C.IBCloseContext(context.context)
 	return msgToError(msg)
 }
 
-func (context *Context) RegMr(buf []byte) error {
+func (context *Context) RegMr(ctx context.Context, buf []byte) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.RegMr")
+	defer span.Finish()
 	msg := C.IBRegMr(context.context, unsafe.Pointer(&buf[0]), C.long(len(buf)))
 	return msgToError(msg)
 }
 
-func (context *Context) UnRegMr() error {
+func (context *Context) UnRegMr(ctx context.Context) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.UnRegMr")
+	defer span.Finish()
 	msg := C.IBUnRegMr(context.context)
 	return msgToError(msg)
 }
 
-func (context *Context) Connect(info *ConnectionInfo) error {
+func (context *Context) Connect(ctx context.Context, info *ConnectionInfo) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.Connect")
+	defer span.Finish()
 	msg := C.IBConnect(context.context, &info.info)
 	return msgToError(msg)
 }
 
-func (context *Context) postRead_(
+func (context *Context) postRead_(ctx context.Context,
 	laddr unsafe.Pointer, raddr unsafe.Pointer, length uint32,
 	rkey C.uint32_t, send_signaled bool) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.postRead_")
+	defer span.Finish()
+
 	log.Debugf("laddr: %d, raddr: %d, length: %d, rkey: %d", laddr, raddr, length, rkey)
 	msg := C.IBPostRead(context.context,
 		laddr, raddr, C.uint32_t(length), rkey, C.bool(send_signaled))
 	return msgToError(msg)
 }
 
-func (context *Context) Read(buf *Buf) error {
+func (context *Context) Read(ctx context.Context, buf *Buf) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.Read")
+	defer span.Finish()
+
 	lBuf, err := context.GetBuf()
 	if err != nil {
 		return nil
@@ -160,11 +178,11 @@ func (context *Context) Read(buf *Buf) error {
 		if sizeLeft < l {
 			l = sizeLeft
 		}
-		err = context.postRead_(laddr, raddr, uint32(l), rkey, true)
+		err = context.postRead_(ctx, laddr, raddr, uint32(l), rkey, true)
 		if err != nil {
 			return nil
 		}
-		err = context.Poll(POLL_TIMEOUT_MS)
+		err = context.Poll(ctx, POLL_TIMEOUT_MS)
 		if err != nil {
 			return nil
 		}
@@ -176,17 +194,26 @@ func (context *Context) Read(buf *Buf) error {
 	return nil
 }
 
-func (context *Context) PostSendEmpty(send_signaled bool) error {
+func (context *Context) PostSendEmpty(ctx context.Context, send_signaled bool) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.PostSendEmpty")
+	defer span.Finish()
+
 	msg := C.IBPostSendEmpty(context.context, C.bool(send_signaled))
 	return msgToError(msg)
 }
 
-func (context *Context) PostRecvEmpty() error {
+func (context *Context) PostRecvEmpty(ctx context.Context) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.PostRecvEmpty")
+	defer span.Finish()
+
 	msg := C.IBPostRecvEmpty(context.context)
 	return msgToError(msg)
 }
 
-func (context *Context) Poll(timeout_ms int) error {
+func (context *Context) Poll(ctx context.Context, timeout_ms int) error {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Context.Poll")
+	defer span.Finish()
+
 	msg := C.IBPoll(context.context, C.int(timeout_ms))
 	return msgToError(msg)
 }
@@ -208,7 +235,5 @@ func (context *Context) GetBuf() (*Buf, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("addr: %d, length: %d, rkey: %d", buf.buf.addr, buf.buf.length, buf.buf.rkey)
-
 	return buf, nil
 }

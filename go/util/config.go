@@ -26,10 +26,14 @@ type EtcdServer struct {
 }
 
 type StorageServer struct {
-	Hostname         string `yaml:"hostname"`
-	RpcPort          int    `yaml:"rpc_port"`
-	PlasmaSocket     string `yaml:"plasma_socket"`
-	PlasmaMemoryByte int    `yaml:"plasma_memory_byte"`
+	Hostname                  string `yaml:"hostname"`
+	RpcPort                   int    `yaml:"rpc_port"`
+	PlasmaSocket              string `yaml:"plasma_socket"`
+	PlasmaMemoryByte          int    `yaml:"plasma_memory_byte"`
+	RdmaDeviceName            string `yaml:"rdma_device_name"`
+	RdmaDevicePort            uint8  `yaml:"rdma_device_port"`
+	RdmaGidIndex              uint8  `yaml:"rdma_device_gid_index"`
+	RdmaTransferThresholdByte int64  `yaml:"rdma_transfer_threshold_byte"`
 }
 
 type StorageClient struct {

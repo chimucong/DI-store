@@ -31,13 +31,14 @@ type StorageServer struct {
 	PlasmaClient         *plasma_client.PlasmaClient
 	NodeTrackerRpcTarget string
 	// NodeTrackerClient   *node_tracker.NodeTrackerClient
-	RpcListener         net.Listener
-	ObjTransferListener net.Listener
-	ServerInfoMap       map[string]*pbNodeTracker.StorageServer
-	mu                  sync.Mutex
-	FetchTaskManager    *FetchTaskManager
-	GroupList           []string
-	RdmaDevice          *rdma.Device
+	RpcListener           net.Listener
+	ObjTransferListener   net.Listener
+	ServerInfoMap         map[string]*pbNodeTracker.StorageServer
+	mu                    sync.Mutex
+	FetchTaskManager      *FetchTaskManager
+	GroupList             []string
+	RdmaDevice            *rdma.Device
+	RdmaTransferThreshold int64
 }
 
 func NewStorageServer(
@@ -49,6 +50,10 @@ func NewStorageServer(
 	plasmaSocket string,
 	plasmaMemoryByte int,
 	groupList []string,
+	rdmaDevName string,
+	rdmaDevPort uint8,
+	rdmaGixIdx uint8,
+	rdmaTransferThreshold int64,
 ) (*StorageServer, error) {
 	if hostname == "" {
 		hostname = os.Getenv("DI_STORE_NODE_NAME")
@@ -94,20 +99,28 @@ func NewStorageServer(
 		return nil, fmt.Errorf("failed to register storage server: %v", err)
 	}
 	// todo init rdma device
-	rdmaDev, err := rdma.OpenDevice("mlx5_0")
-	if err != nil {
-		return nil, err
+	var rdmaDev *rdma.Device = nil
+	if rdmaDevName != "" {
+		if rdmaDevName == "auto" {
+			rdmaDevName = ""
+		}
+		rdmaDev, err = rdma.OpenDevice(rdmaDevName, rdmaDevPort, rdmaGixIdx)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	server := &StorageServer{
-		Hostname:             hostname,
-		PlasmaClient:         plasmaClient,
-		NodeTrackerRpcTarget: nodeTrackerRpcTarget,
-		RpcListener:          rpcLis,
-		ObjTransferListener:  objTransferLis,
-		ServerInfoMap:        make(map[string]*pbNodeTracker.StorageServer),
-		FetchTaskManager:     NewFetchTaskManager(),
-		GroupList:            groupList,
-		RdmaDevice:           rdmaDev,
+		Hostname:              hostname,
+		PlasmaClient:          plasmaClient,
+		NodeTrackerRpcTarget:  nodeTrackerRpcTarget,
+		RpcListener:           rpcLis,
+		ObjTransferListener:   objTransferLis,
+		ServerInfoMap:         make(map[string]*pbNodeTracker.StorageServer),
+		FetchTaskManager:      NewFetchTaskManager(),
+		GroupList:             groupList,
+		RdmaDevice:            rdmaDev,
+		RdmaTransferThreshold: rdmaTransferThreshold,
 	}
 
 	err = server.UpdateServerInfoMap(context.Background())

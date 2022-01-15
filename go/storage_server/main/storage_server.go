@@ -82,12 +82,19 @@ func main() {
 		}
 		flattenedGroupList = append(flattenedGroupList, strings.Split(group, ",")...)
 	}
-	// todo context
+
+	// if RdmaDevicePort is not set, set it to 1
+	if serverInfo.RdmaDevicePort == 0 {
+
+		serverInfo.RdmaDevicePort = 1
+	}
 	server, err := storage_server.NewStorageServer(
 		context.Background(), *hostname, serverInfo.RpcPort,
 		trackerInfo.RpcHost, trackerInfo.RpcPort, serverInfo.PlasmaSocket,
-		serverInfo.PlasmaMemoryByte,
-		flattenedGroupList)
+		serverInfo.PlasmaMemoryByte, flattenedGroupList,
+		serverInfo.RdmaDeviceName, serverInfo.RdmaDevicePort,
+		serverInfo.RdmaGidIndex, serverInfo.RdmaTransferThresholdByte,
+	)
 	if err != nil {
 		log.Fatalf("failed to create StorageServer: %+v", err)
 	}
