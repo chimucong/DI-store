@@ -6,6 +6,9 @@ User root
 
 RUN yum install -y epel-release
 RUN yum install -y gflags
+RUN yum install -y infiniband-diags
+RUN yum install -y libibverbs
+RUN yum install -y strace
 RUN python3 -m pip install --upgrade pip
 
 ADD setup.py setup.py

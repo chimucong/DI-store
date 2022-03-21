@@ -277,7 +277,17 @@ func (server *StorageServer) tryFetchViaRdma(ctx context.Context, oid []byte, re
 		if header.GetRdmaSupport() {
 			rdmaCtx := <-chRdmaCtx
 			if rdmaCtx != nil {
-				chCreateBuf <- rdmaCtx.RegMr(ctx, plasmaBuff.ToByteSlice())
+				buffSlice := plasmaBuff.ToByteSlice()
+				if server.RdmaMemWarmup {
+					span, _ = opentracing.StartSpanFromContext(ctx, "util.WarmupBytes")
+					util.WarmupBytes(buffSlice, server.RdmaMemWarmupChunk, server.RdmaMemWarmupThread)
+					span.LogFields(
+						ot_log.Int("chunk_size", server.RdmaMemWarmupChunk),
+						ot_log.Int("thread_number", server.RdmaMemWarmupThread),
+					)
+					span.Finish()
+				}
+				chCreateBuf <- rdmaCtx.RegMr(ctx, buffSlice)
 				return
 			}
 		}
@@ -456,7 +466,7 @@ func (server *StorageServer) objTransferListenLoop() {
 }
 
 func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn net.Conn) {
-	log.Debugf("processObjTransferRequest, remote: %v", conn.RemoteAddr().String())
+	log.Debugf("processObjTransferRequest start, remote: %v", conn.RemoteAddr().String())
 
 	rw := util.NewBytesReadWriter(conn)
 	defer conn.Close()
@@ -468,13 +478,13 @@ func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn
 	{
 		buf, err := rw.Read(nil)
 		if err != nil {
-			finErr = err
+			finErr = errors.Wrapf(err, "socket read")
 			goto FIN
 		}
 		header := &pb_object_fetch.FetchHeader{}
 		err = proto.Unmarshal(buf, header)
 		if err != nil {
-			finErr = err
+			finErr = errors.Wrapf(err, "proto.Unmarshal")
 			goto FIN
 		}
 		remoteRdmaSupport = header.GetRdmaSupport()
@@ -504,17 +514,17 @@ func (server *StorageServer) processObjTransferRequest(ctx context.Context, conn
 
 		oid = header.GetObjectId()
 		if len(oid) != 20 {
-			finErr = fmt.Errorf("oid len error: %v", len(oid))
+			finErr = errors.Errorf("oid len error: %v", len(oid))
 			goto FIN
 		}
 		buff, err := server.PlasmaClient.GetBuff(ctx, oid)
 		defer buff.Release(ctx)
 		if err != nil {
-			finErr = err
+			finErr = errors.Wrap(err, "PlasmaClient.GetBuff")
 			goto FIN
 		}
 		if buff.IsEmpty() {
-			finErr = fmt.Errorf("object not found")
+			finErr = errors.Errorf("object not found")
 		} else {
 			data = util.BytesWithoutCopy(buff.Data(), buff.Size())
 		}
@@ -539,20 +549,20 @@ FIN:
 		}
 		buf, err := proto.Marshal(header)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "proto.Marshal")
 		}
 
 		_span, _ := opentracing.StartSpanFromContext(ctx, "processObjTransferRequest.WriteHeader")
 		_, err = rw.Write(buf)
 		_span.Finish()
 		if err != nil {
-			return err
+			return errors.Wrap(err, "socket write")
 		}
 
 		if rdmaSupport {
 			rdmaCtx, err := server.RdmaDevice.NewContext(ctx)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RdmaDevice.NewContext")
 			}
 			defer rdmaCtx.Close(ctx)
 
@@ -563,64 +573,67 @@ FIN:
 
 			connInfo, err := rdmaCtx.GetConnectionInfo()
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RdmaCtx.GetConnectionInfo")
 			}
 			connInfoMsg := &pb_object_fetch.ConnectionInfo{Info: connInfo.ToBytes()}
 			buf, err := proto.Marshal(connInfoMsg)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "proto.Marshal")
 			}
 			_, err = rw.Write(buf)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "socket write")
 			}
 
 			buf, err = rw.Read(nil)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "socket read")
 			}
 
 			err = proto.Unmarshal(buf, connInfoMsg)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "proto.Unmarshal")
 			}
 			connInfo = rdma.ConnectionInfoFromBytes(connInfoMsg.GetInfo())
 			err = rdmaCtx.Connect(ctx, connInfo)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "rdmaCtx.Connect")
 			}
 
 			err = <-chRegMr
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RegMr")
 			}
 
 			rbuf, err := rdmaCtx.GetBuf()
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RdmaCtx.GetBuf")
 			}
 			err = rdmaCtx.PostRecvEmpty(ctx)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RdmaCtx.PostRecvEmpty")
 			}
 
 			rBufMsg := pb_object_fetch.RBuf{Rbuf: rbuf.ToBytes()}
 			buf, err = proto.Marshal(&rBufMsg)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "proto.Marshal")
 			}
 			_, err = rw.Write(buf)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "socket write")
 			}
 			err = rdmaCtx.Poll(ctx, rdma.POLL_TIMEOUT_MS)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "RdmaCtx.Poll")
 			}
 		} else {
 			_span, _ = opentracing.StartSpanFromContext(ctx, "processObjTransferRequest.WriteData")
 			_, err = rw.Write(data)
 			_span.Finish()
+			if err != nil {
+				return errors.Wrap(err, "socket write data")
+			}
 		}
 
 		if span != nil {
@@ -630,11 +643,12 @@ FIN:
 		return nil
 	}()
 	if finErr != nil {
-		log.Error(fmt.Errorf("processObjTransferRequest error: %v", finErr))
+		log.Error(errors.Errorf("processObjTransferRequest error: %+v", finErr))
 	}
 	if err != nil {
-		log.Error(fmt.Errorf("processObjTransferRequest error: %v", err))
+		log.Error(errors.Errorf("processObjTransferRequest error: %+v", err))
 	}
+	log.Debugf("processObjTransferRequest end, remote: %v", conn.RemoteAddr().String())
 }
 
 func (server *StorageServer) processObjTransferRequestTmp(ctx context.Context, conn net.Conn) {

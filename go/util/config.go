@@ -34,6 +34,9 @@ type StorageServer struct {
 	RdmaDevicePort            uint8  `yaml:"rdma_device_port"`
 	RdmaGidIndex              uint8  `yaml:"rdma_device_gid_index"`
 	RdmaTransferThresholdByte int64  `yaml:"rdma_transfer_threshold_byte"`
+	RdmaMemWarmup             bool   `yaml:"rdma_mem_warmup"`
+	RdmaMemWarmupThreadNumber int    `yaml:"rdma_mem_warmup_thread_number" default:"8"`
+	RdmaMemWarmupChunkByte    int    `yaml:"rdma_mem_warmup_chunk_byte" default:"16777216"`
 }
 
 type StorageClient struct {
@@ -74,6 +77,9 @@ func ReadConfig(path string) (*Config, error) {
 	}
 	conf.configFilePath = path
 	CommonConfig = &conf.Common
+	for idx := range conf.StorageServers {
+		defaults.Set(&conf.StorageServers[idx])
+	}
 	return conf, nil
 }
 

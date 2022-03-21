@@ -39,6 +39,9 @@ type StorageServer struct {
 	GroupList             []string
 	RdmaDevice            *rdma.Device
 	RdmaTransferThreshold int64
+	RdmaMemWarmup         bool
+	RdmaMemWarmupThread   int
+	RdmaMemWarmupChunk    int
 }
 
 func NewStorageServer(
@@ -54,6 +57,9 @@ func NewStorageServer(
 	rdmaDevPort uint8,
 	rdmaGixIdx uint8,
 	rdmaTransferThreshold int64,
+	rdmaMemWarmup bool,
+	rdmaMemWarmupThread int,
+	rdmaMemWarmupChunk int,
 ) (*StorageServer, error) {
 	if hostname == "" {
 		hostname = os.Getenv("DI_STORE_NODE_NAME")
@@ -121,6 +127,9 @@ func NewStorageServer(
 		GroupList:             groupList,
 		RdmaDevice:            rdmaDev,
 		RdmaTransferThreshold: rdmaTransferThreshold,
+		RdmaMemWarmup:         rdmaMemWarmup,
+		RdmaMemWarmupThread:   rdmaMemWarmupThread,
+		RdmaMemWarmupChunk:    rdmaMemWarmupChunk,
 	}
 
 	err = server.UpdateServerInfoMap(context.Background())

@@ -94,6 +94,7 @@ func main() {
 		serverInfo.PlasmaMemoryByte, flattenedGroupList,
 		serverInfo.RdmaDeviceName, serverInfo.RdmaDevicePort,
 		serverInfo.RdmaGidIndex, serverInfo.RdmaTransferThresholdByte,
+		serverInfo.RdmaMemWarmup, serverInfo.RdmaMemWarmupThreadNumber, serverInfo.RdmaMemWarmupChunkByte,
 	)
 	if err != nil {
 		log.Fatalf("failed to create StorageServer: %+v", err)
